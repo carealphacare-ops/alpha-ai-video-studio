@@ -1,0 +1,26 @@
+name: Windows installer
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p alpha-core
+      - run: npm ci
+      - run: ./scripts/fetch-ffmpeg.ps1
+        shell: pwsh
+      - run: npm run tauri build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: alpha-ai-video-studio-windows
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            target/release/bundle/nsis/*.exe
+            target/release/bundle/msi/*.msi

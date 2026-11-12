@@ -16,8 +16,8 @@ pub struct AppState {
 
 type Res<T> = Result<T, String>;
 
-   fn lock<'a>(s: &'a State<'a, AppState>) -> Res<std::sync::MutexGuard<'a, Connection>> {
-       s.db.lock().map_err(|_| "database lock poisoned".to_string())
+fn lock<'a>(s: &'a State<'a, AppState>) -> Res<std::sync::MutexGuard<'a, Connection>> {
+    s.db.lock().map_err(|_| "database lock poisoned".to_string())
 }
 
 fn get_setting(conn: &Connection, key: &str) -> Option<String> {
@@ -257,7 +257,9 @@ struct ToolStatus {
 }
 
 fn tools(app: &AppHandle, state: &State<AppState>) -> Res<(PathBuf, PathBuf)> {
-    let dir = get_setting(&lock(state)?, "ffmpeg_dir");
+    let conn = lock(state)?;
+    let dir = get_setting(&conn, "ffmpeg_dir");
+    drop(conn);
     let res = app.path().resource_dir().ok();
     Ok((
         media::tool_path("ffmpeg", dir.as_deref(), res.as_deref()),

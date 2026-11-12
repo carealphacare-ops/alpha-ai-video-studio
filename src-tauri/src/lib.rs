@@ -16,8 +16,8 @@ pub struct AppState {
 
 type Res<T> = Result<T, String>;
 
-fn lock(s: &State<AppState>) -> Res<std::sync::MutexGuard<'_, Connection>> {
-    s.db.lock().map_err(|_| "database lock poisoned".to_string())
+   fn lock<'a>(s: &'a State<'a, AppState>) -> Res<std::sync::MutexGuard<'a, Connection>> {
+       s.db.lock().map_err(|_| "database lock poisoned".to_string())
 }
 
 fn get_setting(conn: &Connection, key: &str) -> Option<String> {

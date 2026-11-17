@@ -48,6 +48,7 @@ dependencies = [
 name = "alpha-ai-video-studio"
 version = "0.1.0"
 dependencies = [
+ "alpha-core",
  "keyring",
  "rusqlite",
  "serde",

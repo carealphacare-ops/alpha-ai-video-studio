@@ -4,6 +4,9 @@ export interface Project { id: string; name: string; kind: string; status: strin
 export interface ProviderState { id: string; enabled: boolean; has_key: boolean; model: string | null }
 export interface UsageSummary { month_estimated: number; month_actual: number; count: number }
 export interface Job { id: string; kind: string; status: string; progress: number; error: string | null; output_path: string | null; updated_at: number }
+export interface StartedJob { id: string; output: string }
+export interface Word { text: string; start: number; end: number }
+export interface Transcript { language: string; words: Word[] }
 export interface ToolStatus { ffmpeg: string | null; ffprobe: string | null }
 
 export const api = {
@@ -26,6 +29,14 @@ export const api = {
   probeMedia: (path: string) => invoke<string>("probe_media", { path }),
   startTrimExport: (input: string, output: string, start: number, end: number) =>
     invoke<string>("start_trim_export", { input, output, start, end }),
+  transcribeStatus: () => invoke<{ ready: boolean; detail: string }>("transcribe_status"),
+  startTranscribe: (input: string, language: string) => invoke<StartedJob>("start_transcribe", { input, language }),
+  loadTranscript: async (path: string) => JSON.parse(await invoke<string>("load_transcript", { path })) as Transcript,
+  saveTranscript: (path: string, t: Transcript) => invoke<void>("save_transcript", { path, json: JSON.stringify(t) }),
+  exportCaptions: (transcript: string, format: string, output: string, style: string, start: number, end: number, width: number, height: number) =>
+    invoke<void>("export_captions", { transcript, format, output, style, start, end, width, height }),
+  startCaptionClip: (input: string, transcript: string, output: string, start: number, end: number, style: string) =>
+    invoke<StartedJob>("start_caption_clip", { input, transcript, output, start, end, style }),
   cancelJob: (id: string) => invoke<void>("cancel_job", { id }),
 };
 

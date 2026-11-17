@@ -15,6 +15,7 @@ jobs:
       - run: cargo test -p alpha-core
       - run: npm ci
       - run: ./scripts/fetch-ffmpeg.ps1
+        shell: pwsh
       - run: ./scripts/fetch-whisper.ps1
         shell: pwsh
       - run: npm run tauri build

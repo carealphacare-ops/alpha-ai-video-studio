@@ -1,10 +1,12 @@
 //! alpha-core: all real application logic, independent of the UI shell.
 
+pub mod captions;
 pub mod db;
 pub mod jobs;
 pub mod media;
 pub mod projects;
 pub mod settings;
+pub mod transcribe;
 pub mod usage;
 
 use thiserror::Error;

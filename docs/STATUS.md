@@ -1,20 +1,23 @@
-# Status (12 Nov 2026)
+# Status (13 Nov 2026)
 
-## Tested here (Linux container)
-- `cargo test -p alpha-core`: 13 tests pass (database, projects, settings, media probe/trim, jobs, usage/budget).
-- `npm run build`: TypeScript check and Vite build pass.
+## Verified on a real Windows PC (by you)
+- Installer builds on GitHub Actions and installs.
+- App opens, Settings and Clipping pages load, local video import, preview and trim-export to MP4 work.
 
-## NOT tested yet
-- The Tauri window itself (`src-tauri`) has **not been compiled or run**. This container has no GTK/WebKit and no Windows. The first Windows CI run will be the first real compile. Expect a few fixes.
-- The Windows installer has not been built. Run the "Windows installer" GitHub Action (see BUILD_WINDOWS.md).
+## Tested in the Linux container (`cargo test -p alpha-core`, 23 tests)
+- Database, projects, settings, jobs, spending limits.
+- Transcript parsing, caption grouping, SRT/VTT/ASS output, ASS colours, FFmpeg filter path escaping.
+- Full transcribe pipeline with real FFmpeg and a stand-in Whisper script: audio extraction, progress, result file, burn-in render, and refusal of a range with no speech.
 
-## Genuinely built (code exists, unit-tested in core)
-Projects (create/rename/duplicate/delete), settings, spending limits, SQLite schema, media probe, trim/export via FFmpeg, job rows, usage log with estimate vs actual.
+## NOT verified yet
+- The **real** whisper-cli output format and flags (`-oj -ml 1 -sow -pp`) were written from documentation, never run against the real program. First real transcription on Windows is the test. If word timing looks wrong, the parser already splits multi-word entries by length as a fallback.
+- Tauri shell commands for transcription/captions compiled only after the Windows CI run; they have not been clicked through yet.
+- Urdu/Hindi accuracy with the `base` model. Expect mistakes; the transcript editor exists to fix them.
 
 ## Not built yet
-Everything AI: transcription, highlights, reframing, animated subtitles, story studio, characters, voice, provider calls and connection tests, timeline editor, batch pause/retry, social presets, assistant. Each page in the app says "Planned" or "Partial" honestly.
+Highlight detection and scoring, multi-clip suggestions, vertical reframing and face tracking, silence removal, Story Studio, characters, voice, provider calls, timeline editor, social presets, assistant.
 
 ## Next steps
-1. Run Windows CI, fix compile errors, install and click through the app.
-2. Phase 3: Python faster-whisper sidecar -> word timestamps -> ASS captions.
-3. Runway adapter with a real test-connection call.
+1. Run Windows CI, install, transcribe a short video, burn captions, report problems.
+2. Highlight detection: LLM adapter (Claude/OpenAI/Gemini key) that scores transcript windows.
+3. Vertical 9:16 reframing (centre crop first, face tracking later).

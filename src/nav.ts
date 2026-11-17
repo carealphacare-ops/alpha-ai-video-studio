@@ -12,8 +12,8 @@ export interface NavItem {
 
 export const NAV: NavItem[] = [
   { id: "dashboard", label: "Dashboard", status: "working", summary: "Projects, jobs, exports, usage and tool status from your local database." },
-  { id: "clipping", label: "AI Clipping Studio", status: "partial", summary: "Import a local file, inspect it, preview it and export a trimmed MP4. Transcription and highlight detection are not built yet.",
-    needs: ["FFmpeg (bundled in the installer)"], next: "Phase 3: faster-whisper sidecar, then LLM highlight scoring." },
+  { id: "clipping", label: "AI Clipping Studio", status: "partial", summary: "Import a local file, preview and trim it, transcribe it locally with Whisper, correct the text, export SRT/VTT/ASS, and export a clip with animated word-highlight captions. Highlight detection and vertical reframing are not built yet.",
+    needs: ["FFmpeg (bundled in the installer)"], next: "Highlight detection (needs a language-model key), then vertical reframing." },
   { id: "story", label: "AI Story Studio", status: "planned", summary: "Idea/script to scenes to video. Not built yet.",
     needs: ["A language-model API key", "An image or video provider key (paid credits)", "A voice provider key or local TTS"], next: "Phase 4: provider adapters, then script-to-scenes." },
   { id: "videogen", label: "AI Video Generator", status: "planned", summary: "Direct text/image-to-video via provider APIs. Not built yet.", needs: ["Provider API key", "Paid credits"], next: "Phase 7: Runway adapter first (pricing verified, see docs/PROVIDERS.md)." },

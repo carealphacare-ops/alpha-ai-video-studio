@@ -1,3 +1,5 @@
+use alpha_core::{captions, transcribe};
+
 mod db;
 mod media;
 mod secrets;
@@ -359,6 +361,259 @@ async fn start_trim_export(
     Ok(job_id)
 }
 
+// ---------- transcription and captions ----------
+
+#[derive(Serialize)]
+struct StartedJob {
+    id: String,
+    output: String,
+}
+
+#[derive(Serialize)]
+struct TranscribeStatus {
+    ready: bool,
+    detail: String,
+}
+
+/// Looks for the bundled whisper.cpp engine and model. `ALPHA_WHISPER_CLI` / `ALPHA_WHISPER_MODEL` override for development.
+fn whisper_paths(app: &AppHandle) -> (PathBuf, PathBuf) {
+    let exe = if cfg!(windows) { "whisper-cli.exe" } else { "whisper-cli" };
+    let res = app.path().resource_dir().ok().map(|r| r.join("whisper"));
+    let cli = std::env::var_os("ALPHA_WHISPER_CLI")
+        .map(PathBuf::from)
+        .or_else(|| res.as_ref().map(|d| d.join(exe)).filter(|p| p.is_file()))
+        .unwrap_or_else(|| PathBuf::from(exe));
+    let model = std::env::var_os("ALPHA_WHISPER_MODEL")
+        .map(PathBuf::from)
+        .or_else(|| res.as_ref().map(|d| d.join("ggml-base.bin")).filter(|p| p.is_file()))
+        .unwrap_or_else(|| PathBuf::from("ggml-base.bin"));
+    (cli, model)
+}
+
+#[tauri::command]
+fn transcribe_status(app: AppHandle) -> TranscribeStatus {
+    let (cli, model) = whisper_paths(&app);
+    let ready = cli.is_file() && model.is_file();
+    let detail = if ready {
+        "Local Whisper engine and model found.".to_string()
+    } else {
+        format!(
+            "Transcription engine not found (looked for {} and {}). The Windows installer includes them. In development, set ALPHA_WHISPER_CLI and ALPHA_WHISPER_MODEL.",
+            cli.display(),
+            model.display()
+        )
+    };
+    TranscribeStatus { ready, detail }
+}
+
+/// Only files this app wrote (`<app data>/transcripts/<job>/transcript.json`) may be read or changed.
+fn transcript_path(app: &AppHandle, p: &str) -> Res<PathBuf> {
+    let base = app.path().app_data_dir().map_err(|e| e.to_string())?.join("transcripts");
+    let base = std::fs::canonicalize(&base).map_err(|_| "No transcripts yet.".to_string())?;
+    let path = std::fs::canonicalize(p).map_err(|_| "Transcript file not found.".to_string())?;
+    if !path.starts_with(&base) || path.file_name().and_then(|n| n.to_str()) != Some("transcript.json") {
+        return Err("That file is not one of this app's transcripts.".into());
+    }
+    Ok(path)
+}
+
+fn read_transcript(app: &AppHandle, p: &str) -> Res<captions::Transcript> {
+    let path = transcript_path(app, p)?;
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    serde_json::from_str(&text).map_err(|e| format!("Transcript file is damaged: {e}"))
+}
+
+/// Registers a job row, runs `work` on a background thread, and reports real progress, cancel and result.
+#[allow(clippy::too_many_arguments)]
+fn spawn_job<F>(
+    app: AppHandle,
+    state: &State<'_, AppState>,
+    job_id: String,
+    kind: &str,
+    payload: String,
+    output_path: String,
+    export_path: Option<PathBuf>,
+    work: F,
+) -> Res<()>
+where
+    F: FnOnce(&dyn Fn() -> bool, &mut dyn FnMut(f64)) -> Result<(), String> + Send + 'static,
+{
+    {
+        let conn = state.db.lock().map_err(|_| "database lock poisoned".to_string())?;
+        conn.execute(
+            "INSERT INTO jobs(id,kind,status,progress,payload,output_path,created_at,updated_at) VALUES(?1,?2,'processing',0,?3,?4,?5,?5)",
+            params![job_id, kind, payload, output_path, db::now()],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    let db = state.db.clone();
+    let cancelled = state.cancelled.clone();
+    let jid = job_id;
+    tauri::async_runtime::spawn_blocking(move || {
+        let cancel_id = jid.clone();
+        let cancel_set = cancelled.clone();
+        let is_cancelled = move || cancel_set.lock().map(|s| s.contains(&cancel_id)).unwrap_or(false);
+        let (app2, jid2, db2) = (app.clone(), jid.clone(), db.clone());
+        let mut last = 0.0;
+        let mut on_progress = move |p: f64| {
+            if p - last >= 0.01 || p >= 1.0 {
+                last = p;
+                let _ = app2.emit("job-progress", JobProgress { id: jid2.clone(), progress: p });
+                if let Ok(c) = db2.lock() {
+                    let _ = c.execute("UPDATE jobs SET progress=?1, updated_at=?2 WHERE id=?3", params![p, db::now(), jid2]);
+                }
+            }
+        };
+        let result = work(&is_cancelled, &mut on_progress);
+        let (status, err) = match &result {
+            Ok(()) => ("completed", None),
+            Err(e) if e == "Cancelled" => ("cancelled", None),
+            Err(e) => ("failed", Some(e.clone())),
+        };
+        if let Ok(c) = db.lock() {
+            let _ = c.execute("UPDATE jobs SET status=?1, error=?2, updated_at=?3 WHERE id=?4", params![status, err, db::now(), jid]);
+            if status == "completed" {
+                if let Some(path) = &export_path {
+                    let _ = c.execute(
+                        "INSERT INTO exports(id,project_id,path,created_at) VALUES(?1,NULL,?2,?3)",
+                        params![uuid::Uuid::new_v4().to_string(), path.to_string_lossy(), db::now()],
+                    );
+                }
+            }
+        }
+        let _ = app.emit("job-finished", serde_json::json!({"id": jid, "status": status, "error": err}));
+    });
+    Ok(())
+}
+
+#[tauri::command]
+async fn start_transcribe(app: AppHandle, state: State<'_, AppState>, input: String, language: String) -> Res<StartedJob> {
+    let input_p = media::validate_media_path(&input)?;
+    let (ff, _) = tools(&app, &state)?;
+    let (cli, model) = whisper_paths(&app);
+    if !cli.is_file() || !model.is_file() {
+        return Err("The transcription engine is not installed. Use the Windows installer build, which includes it.".into());
+    }
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let work_dir = app.path().app_data_dir().map_err(|e| e.to_string())?.join("transcripts").join(&job_id);
+    let out = work_dir.join("transcript.json").to_string_lossy().to_string();
+    let cfg = transcribe::WhisperConfig { ffmpeg: ff, whisper: cli, model, language, work_dir };
+    spawn_job(
+        app,
+        &state,
+        job_id.clone(),
+        "transcribe",
+        serde_json::json!({ "input": input }).to_string(),
+        out.clone(),
+        None,
+        move |cancel, prog| transcribe::transcribe(&cfg, &input_p, cancel, prog).map(|_| ()),
+    )?;
+    Ok(StartedJob { id: job_id, output: out })
+}
+
+#[tauri::command]
+fn load_transcript(app: AppHandle, path: String) -> Res<String> {
+    let t = read_transcript(&app, &path)?;
+    serde_json::to_string(&t).map_err(|e| e.to_string())
+}
+
+/// Saves a corrected transcript (for example after fixing a misheard name).
+#[tauri::command]
+fn save_transcript(app: AppHandle, path: String, json: String) -> Res<()> {
+    let p = transcript_path(&app, &path)?;
+    let t: captions::Transcript = serde_json::from_str(&json).map_err(|e| format!("Not a valid transcript: {e}"))?;
+    let text = serde_json::to_string_pretty(&t).map_err(|e| e.to_string())?;
+    std::fs::write(p, text).map_err(|e| format!("Cannot save transcript: {e}"))
+}
+
+/// Writes an SRT, VTT or ASS file. If `end > start` only that range is used (times are moved so it starts at 0).
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn export_captions(
+    app: AppHandle,
+    transcript: String,
+    format: String,
+    output: String,
+    style: String,
+    start: f64,
+    end: f64,
+    width: u32,
+    height: u32,
+) -> Res<()> {
+    let t = read_transcript(&app, &transcript)?;
+    let ext = match format.as_str() {
+        "srt" => "srt",
+        "vtt" => "vtt",
+        "ass" => "ass",
+        _ => return Err("Unknown caption format.".into()),
+    };
+    let out = PathBuf::from(&output);
+    if out.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).as_deref() != Some(ext) {
+        return Err(format!("Output file must end in .{ext}"));
+    }
+    if let Some(dir) = out.parent() {
+        if !dir.as_os_str().is_empty() && !dir.is_dir() {
+            return Err("Output folder does not exist.".into());
+        }
+    }
+    let words = if end > start { captions::clip_words(&t.words, start, end) } else { t.words.clone() };
+    if words.is_empty() {
+        return Err("There is no speech in that range.".into());
+    }
+    let st = captions::preset(&style);
+    let lines = if ext == "ass" { captions::group_lines(&words, st.max_words, 28, 0.8) } else { captions::group_lines(&words, 7, 42, 0.8) };
+    let body = match ext {
+        "srt" => captions::to_srt(&lines),
+        "vtt" => captions::to_vtt(&lines),
+        _ => captions::to_ass(&lines, &st, width.max(16), height.max(16)),
+    };
+    std::fs::write(&out, body).map_err(|e| format!("Cannot write file: {e}"))
+}
+
+/// Cuts [start, end] and burns animated word-highlight captions into the MP4.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn start_caption_clip(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    input: String,
+    transcript: String,
+    output: String,
+    start: f64,
+    end: f64,
+    style: String,
+) -> Res<StartedJob> {
+    let input_p = media::validate_media_path(&input)?;
+    let output_p = PathBuf::from(&output);
+    if output_p.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) != Some("mp4".into()) {
+        return Err("Output file must end in .mp4".into());
+    }
+    if let Some(dir) = output_p.parent() {
+        if !dir.is_dir() {
+            return Err("Output folder does not exist.".into());
+        }
+    }
+    let t = read_transcript(&app, &transcript)?;
+    let (ff, fp) = tools(&app, &state)?;
+    let size = transcribe::video_size_from_probe(&media::probe(&fp, &input_p)?)
+        .ok_or_else(|| "This file has no video picture to put captions on.".to_string())?;
+    let st = captions::preset(&style);
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let work_dir = app.path().app_data_dir().map_err(|e| e.to_string())?.join("render").join(&job_id);
+    let out2 = output_p.clone();
+    spawn_job(
+        app,
+        &state,
+        job_id.clone(),
+        "caption_clip",
+        serde_json::json!({ "input": input, "start": start, "end": end, "style": style }).to_string(),
+        output.clone(),
+        Some(output_p),
+        move |cancel, prog| transcribe::render_clip_with_captions(&ff, &input_p, &out2, start, end, &t, &st, size, &work_dir, cancel, prog),
+    )?;
+    Ok(StartedJob { id: job_id, output })
+}
+
 #[tauri::command]
 fn cancel_job(state: State<AppState>, id: String) -> Res<()> {
     state.cancelled.lock().map_err(|_| "lock".to_string())?.insert(id);
@@ -413,6 +668,12 @@ pub fn run() {
             probe_media,
             start_trim_export,
             cancel_job,
+            transcribe_status,
+            start_transcribe,
+            load_transcript,
+            save_transcript,
+            export_captions,
+            start_caption_clip,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ALPHA AI VIDEO STUDIO");

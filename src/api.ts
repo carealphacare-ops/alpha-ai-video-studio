@@ -7,6 +7,7 @@ export interface Job { id: string; kind: string; status: string; progress: numbe
 export interface StartedJob { id: string; output: string }
 export interface Word { text: string; start: number; end: number }
 export interface Transcript { language: string; words: Word[] }
+export interface ModelStatus { id: string; label: string; installed: boolean; bundled: boolean; approx_mb: number }
 export interface ToolStatus { ffmpeg: string | null; ffprobe: string | null }
 
 export const api = {
@@ -30,7 +31,9 @@ export const api = {
   startTrimExport: (input: string, output: string, start: number, end: number) =>
     invoke<string>("start_trim_export", { input, output, start, end }),
   transcribeStatus: () => invoke<{ ready: boolean; detail: string }>("transcribe_status"),
-  startTranscribe: (input: string, language: string) => invoke<StartedJob>("start_transcribe", { input, language }),
+  startTranscribe: (input: string, language: string, model: string) => invoke<StartedJob>("start_transcribe", { input, language, model }),
+  listModels: () => invoke<ModelStatus[]>("list_models"),
+  startModelDownload: (id: string) => invoke<StartedJob>("start_model_download", { id }),
   loadTranscript: async (path: string) => JSON.parse(await invoke<string>("load_transcript", { path })) as Transcript,
   saveTranscript: (path: string, t: Transcript) => invoke<void>("save_transcript", { path, json: JSON.stringify(t) }),
   exportCaptions: (transcript: string, format: string, output: string, style: string, start: number, end: number, width: number, height: number) =>

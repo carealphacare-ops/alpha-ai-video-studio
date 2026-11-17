@@ -48,7 +48,7 @@ pub fn parse_whisper_json(json: &str) -> Result<Transcript, String> {
     let v: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("Whisper output is not valid JSON: {e}"))?;
     let entries = v["transcription"].as_array().ok_or("Whisper output has no 'transcription' list.")?;
     let language = v["result"]["language"].as_str().unwrap_or("").to_string();
-    let mut words = Vec::new();
+    let mut words: Vec<Word> = Vec::new();
     for e in entries {
         let text = e["text"].as_str().unwrap_or("");
         if is_noise(text) {
@@ -56,16 +56,50 @@ pub fn parse_whisper_json(json: &str) -> Result<Transcript, String> {
         }
         let (Some(from), Some(to)) = (e["offsets"]["from"].as_f64(), e["offsets"]["to"].as_f64()) else { continue };
         let (from, to) = (from / 1000.0, (to / 1000.0).max(from / 1000.0));
+        // Whisper splits one word into several pieces (very common for Urdu/Hindi). A piece with no
+        // leading space continues the previous word; a piece with a leading space starts a new one.
+        let continues = !words.is_empty() && !text.starts_with(char::is_whitespace);
         let parts: Vec<&str> = text.split_whitespace().collect();
         let total: usize = parts.iter().map(|p| p.chars().count().max(1)).sum();
         let mut t = from;
-        for p in &parts {
+        for (k, p) in parts.iter().enumerate() {
             let share = (to - from) * (p.chars().count().max(1) as f64 / total.max(1) as f64);
-            words.push(Word { text: p.to_string(), start: t, end: t + share });
+            if k == 0 && continues {
+                if let Some(last) = words.last_mut() {
+                    last.text.push_str(p);
+                    last.end = t + share;
+                }
+            } else {
+                words.push(Word { text: p.to_string(), start: t, end: t + share });
+            }
             t += share;
         }
     }
+    let words = collapse_repeats(words, 3);
     Ok(Transcript { language, words })
+}
+
+fn norm(s: &str) -> String {
+    s.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
+}
+
+/// Whisper sometimes gets stuck and repeats one word dozens of times. Keep at most `max_run` in a row.
+pub fn collapse_repeats(words: Vec<Word>, max_run: usize) -> Vec<Word> {
+    let mut out: Vec<Word> = Vec::new();
+    let mut run = 0;
+    for w in words {
+        let same = out.last().map(|l| !norm(&l.text).is_empty() && norm(&l.text) == norm(&w.text)).unwrap_or(false);
+        if same {
+            run += 1;
+            if run >= max_run {
+                continue;
+            }
+        } else {
+            run = 0;
+        }
+        out.push(w);
+    }
+    out
 }
 
 // ---------- grouping ----------
@@ -250,11 +284,6 @@ Style: Default,{font},{size},{pc},{pc},{oc},&H80000000,{bold},0,0,0,100,100,0,0,
     s
 }
 
-/// Escapes a file path for use inside FFmpeg's `ass=` filter (works for Windows drive letters).
-pub fn ffmpeg_filter_path(p: &str) -> String {
-    p.replace('\\', "/").replace(':', "\\:").replace('\'', "\\'").replace('[', "\\[").replace(']', "\\]").replace(',', "\\,")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,10 +335,9 @@ mod tests {
     }
 
     #[test]
-    fn color_and_paths() {
+    fn colors() {
         assert_eq!(ass_color("#FFD60A"), "&H000AD6FF");
         assert_eq!(ass_color("junk"), "&H00FFFFFF");
-        assert_eq!(ffmpeg_filter_path(r"C:\Users\a b\x.ass"), r"C\:/Users/a b/x.ass");
     }
 
     #[test]
@@ -319,5 +347,29 @@ mod tests {
         assert_eq!(c[0].text, "world.");
         assert!((c[0].start - 0.0).abs() < 1e-9);
         assert!((c.last().unwrap().end - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn joins_pieces_of_one_word() {
+        let j = r#"{"transcription":[
+          {"offsets":{"from":0,"to":200},"text":" \u0633\u0644"},
+          {"offsets":{"from":200,"to":400},"text":"\u0627\u0645"},
+          {"offsets":{"from":400,"to":900},"text":" \u062f\u0646\u06cc\u0627"},
+          {"offsets":{"from":900,"to":950},"text":"."}]}"#;
+        let t = parse_whisper_json(j).unwrap();
+        assert_eq!(t.words.len(), 2);
+        assert_eq!(t.words[0].text, "\u{633}\u{644}\u{627}\u{645}");
+        assert!((t.words[0].end - 0.4).abs() < 1e-9);
+        assert_eq!(t.words[1].text, "\u{62f}\u{646}\u{6cc}\u{627}.");
+    }
+
+    #[test]
+    fn stops_repeat_loops() {
+        let w = |t: &str, i: usize| Word { text: t.into(), start: i as f64, end: i as f64 + 0.5 };
+        let mut v: Vec<Word> = (0..50).map(|i| w("good", i)).collect();
+        v.push(w("end", 50));
+        let c = collapse_repeats(v, 3);
+        assert_eq!(c.len(), 4);
+        assert_eq!(c.last().unwrap().text, "end");
     }
 }

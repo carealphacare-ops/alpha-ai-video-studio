@@ -76,7 +76,7 @@ pub fn transcribe(
         .arg(&cfg.model)
         .arg("-f")
         .arg(&wav)
-        .args(["-l", &cfg.language, "-oj", "-ml", "1", "-sow", "-pp", "-of"])
+        .args(["-l", &cfg.language, "-oj", "-ml", "1", "-sow", "-mc", "0", "-pp", "-of"])
         .arg(&prefix)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -111,6 +111,103 @@ pub fn transcribe(
     let _ = std::fs::remove_file(&wav);
     on_progress(1.0);
     Ok(t)
+}
+
+// ---------- model catalogue and download ----------
+
+pub struct ModelInfo {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub file: &'static str,
+    pub url: &'static str,
+    /// Approximate size, used only to show download progress.
+    pub approx_bytes: u64,
+    pub bundled: bool,
+}
+
+pub const MODELS: &[ModelInfo] = &[
+    ModelInfo { id: "base", label: "Base: bundled, fast, weak for Urdu", file: "ggml-base.bin", url: "", approx_bytes: 148_000_000, bundled: true },
+    ModelInfo {
+        id: "small",
+        label: "Small: better accuracy (about 470 MB download)",
+        file: "ggml-small.bin",
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
+        approx_bytes: 488_000_000,
+        bundled: false,
+    },
+    ModelInfo {
+        id: "turbo",
+        label: "Large v3 Turbo, compressed: best accuracy, slower (about 570 MB download)",
+        file: "ggml-large-v3-turbo-q5_0.bin",
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
+        approx_bytes: 574_000_000,
+        bundled: false,
+    },
+];
+
+pub fn model_info(id: &str) -> Option<&'static ModelInfo> {
+    MODELS.iter().find(|m| m.id == id)
+}
+
+/// Downloads `url` to `dest` with curl (included in Windows 10/11). Progress = bytes on disk / `expected`.
+/// The file is written as `dest.part` and renamed only when curl succeeds and at least `min_bytes` arrived.
+pub fn download_file(
+    curl: &Path,
+    url: &str,
+    dest: &Path,
+    expected: u64,
+    min_bytes: u64,
+    cancel: &dyn Fn() -> bool,
+    on_progress: &mut dyn FnMut(f64),
+) -> Result<(), String> {
+    if let Some(dir) = dest.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("Cannot create folder: {e}"))?;
+    }
+    let part = PathBuf::from(format!("{}.part", dest.display()));
+    let _ = std::fs::remove_file(&part);
+    let mut child = command(curl)
+        .args(["-L", "--fail", "--silent", "--show-error", "--retry", "3", "-o"])
+        .arg(&part)
+        .arg(url)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Could not start curl ({e}). Windows 10/11 include curl.exe; check that it is not removed."))?;
+    loop {
+        if cancel() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&part);
+            return Err("Cancelled".into());
+        }
+        match child.try_wait().map_err(|e| e.to_string())? {
+            Some(status) => {
+                if !status.success() {
+                    let mut msg = String::new();
+                    if let Some(mut e) = child.stderr.take() {
+                        use std::io::Read;
+                        let _ = e.read_to_string(&mut msg);
+                    }
+                    let _ = std::fs::remove_file(&part);
+                    return Err(format!("Download failed: {}", msg.trim()));
+                }
+                break;
+            }
+            None => {
+                let got = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+                on_progress((got as f64 / expected.max(1) as f64).clamp(0.0, 0.99));
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+        }
+    }
+    let got = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+    if got < min_bytes {
+        let _ = std::fs::remove_file(&part);
+        return Err(format!("Download looks incomplete ({got} bytes). Try again."));
+    }
+    std::fs::rename(&part, dest).map_err(|e| format!("Cannot save the model file: {e}"))?;
+    on_progress(1.0);
+    Ok(())
 }
 
 /// Width and height of the first video stream from ffprobe JSON.
@@ -148,14 +245,17 @@ pub fn render_clip_with_captions(
     std::fs::create_dir_all(work_dir).map_err(|e| e.to_string())?;
     let ass_path = work_dir.join("captions.ass");
     std::fs::write(&ass_path, captions::to_ass(&lines, style, size.0, size.1)).map_err(|e| e.to_string())?;
-    let vf = format!("ass={}", captions::ffmpeg_filter_path(&ass_path.to_string_lossy()));
+    // FFmpeg runs inside work_dir and gets only the file name, so no drive letter or colon ever
+    // reaches its filter parser (which broke on paths like C:/Users/...).
+    let vf = "ass=captions.ass";
 
     let span = end - start;
     let mut child = command(ffmpeg)
+        .current_dir(work_dir)
         .args(["-y", "-hide_banner", "-loglevel", "error", "-progress", "pipe:1", "-nostats"])
         .args(["-ss", &format!("{start:.3}"), "-to", &format!("{end:.3}"), "-i"])
         .arg(input)
-        .args(["-vf", &vf])
+        .args(["-vf", vf])
         .args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"])
         .args(["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"])
         .arg(output)
@@ -250,10 +350,42 @@ printf '%s' '{\"result\":{\"language\":\"en\"},\"transcription\":[{\"offsets\":{
         assert!(cfg.work_dir.join("transcript.json").is_file());
 
         let out = dir.path().join("out.mp4");
-        render_clip_with_captions(Path::new("ffmpeg"), &video, &out, 0.0, 2.0, &t, &captions::preset("bold_yellow"), (320, 240), &dir.path().join("render"), &|| false, &mut |_| {}).unwrap();
+        render_clip_with_captions(Path::new("ffmpeg"), &video, &out, 0.0, 2.0, &t, &captions::preset("bold_yellow"), (320, 240), &dir.path().join("ren der"), &|| false, &mut |_| {}).unwrap();
         assert!(std::fs::metadata(&out).unwrap().len() > 1000);
         // A range with no speech must be refused, not silently exported.
         let err = render_clip_with_captions(Path::new("ffmpeg"), &video, &dir.path().join("o2.mp4"), 2.5, 3.0, &t, &captions::preset("bold_yellow"), (320, 240), &dir.path().join("r2"), &|| false, &mut |_| {}).unwrap_err();
         assert!(err.contains("no speech"));
+    }
+
+    #[test]
+    fn model_catalogue() {
+        assert!(model_info("small").is_some() && model_info("../evil").is_none());
+        assert!(MODELS.iter().filter(|m| !m.bundled).all(|m| m.url.starts_with("https://huggingface.co/")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn download_with_curl_file_url() {
+        let have_curl = Command::new("curl").arg("--version").output().map(|o| o.status.success()).unwrap_or(false);
+        if !have_curl {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.bin");
+        std::fs::write(&src, vec![7u8; 200_000]).unwrap();
+        let dest = dir.path().join("models").join("m.bin");
+        let url = format!("file://{}", src.display());
+        let mut last = 0.0;
+        download_file(Path::new("curl"), &url, &dest, 200_000, 100_000, &|| false, &mut |p| last = p).unwrap();
+        assert_eq!(std::fs::metadata(&dest).unwrap().len(), 200_000);
+        assert!(!dir.path().join("models").join("m.bin.part").exists());
+        assert_eq!(last, 1.0);
+        // too small -> refused and nothing left behind
+        let dest2 = dir.path().join("models").join("m2.bin");
+        let err = download_file(Path::new("curl"), &url, &dest2, 200_000, 900_000, &|| false, &mut |_| {}).unwrap_err();
+        assert!(err.contains("incomplete") && !dest2.exists());
+        // missing source -> clear error
+        let err = download_file(Path::new("curl"), "file:///no/such/file", &dir.path().join("x.bin"), 10, 1, &|| false, &mut |_| {}).unwrap_err();
+        assert!(err.starts_with("Download failed"));
     }
 }

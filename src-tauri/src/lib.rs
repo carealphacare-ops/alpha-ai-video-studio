@@ -390,6 +390,63 @@ fn whisper_paths(app: &AppHandle) -> (PathBuf, PathBuf) {
     (cli, model)
 }
 
+#[derive(Serialize)]
+struct ModelStatus {
+    id: String,
+    label: String,
+    installed: bool,
+    bundled: bool,
+    approx_mb: u64,
+}
+
+fn model_path(app: &AppHandle, m: &transcribe::ModelInfo) -> Res<PathBuf> {
+    if m.bundled {
+        return Ok(whisper_paths(app).1);
+    }
+    Ok(app.path().app_data_dir().map_err(|e| e.to_string())?.join("models").join(m.file))
+}
+
+#[tauri::command]
+fn list_models(app: AppHandle) -> Res<Vec<ModelStatus>> {
+    transcribe::MODELS
+        .iter()
+        .map(|m| -> Res<ModelStatus> {
+            Ok(ModelStatus {
+                id: m.id.to_string(),
+                label: m.label.to_string(),
+                installed: model_path(&app, m)?.is_file(),
+                bundled: m.bundled,
+                approx_mb: m.approx_bytes / 1_000_000,
+            })
+        })
+        .collect()
+}
+
+/// Downloads an optional Whisper model (only from the fixed list in alpha-core) as a tracked job.
+#[tauri::command]
+async fn start_model_download(app: AppHandle, state: State<'_, AppState>, id: String) -> Res<StartedJob> {
+    let m = transcribe::model_info(&id).filter(|m| !m.bundled).ok_or("Unknown model.")?;
+    let dest = model_path(&app, m)?;
+    if dest.is_file() {
+        return Err("That model is already downloaded.".into());
+    }
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let curl = PathBuf::from(if cfg!(windows) { "curl.exe" } else { "curl" });
+    let (url, expected) = (m.url.to_string(), m.approx_bytes);
+    let out = dest.to_string_lossy().to_string();
+    spawn_job(
+        app,
+        &state,
+        job_id.clone(),
+        "model_download",
+        serde_json::json!({ "model": id }).to_string(),
+        out.clone(),
+        None,
+        move |cancel, prog| transcribe::download_file(&curl, &url, &dest, expected, expected / 2, cancel, prog),
+    )?;
+    Ok(StartedJob { id: job_id, output: out })
+}
+
 #[tauri::command]
 fn transcribe_status(app: AppHandle) -> TranscribeStatus {
     let (cli, model) = whisper_paths(&app);
@@ -487,12 +544,17 @@ where
 }
 
 #[tauri::command]
-async fn start_transcribe(app: AppHandle, state: State<'_, AppState>, input: String, language: String) -> Res<StartedJob> {
+async fn start_transcribe(app: AppHandle, state: State<'_, AppState>, input: String, language: String, model: String) -> Res<StartedJob> {
     let input_p = media::validate_media_path(&input)?;
     let (ff, _) = tools(&app, &state)?;
-    let (cli, model) = whisper_paths(&app);
-    if !cli.is_file() || !model.is_file() {
+    let (cli, _) = whisper_paths(&app);
+    let info = transcribe::model_info(&model).ok_or("Unknown model.")?;
+    let model = model_path(&app, info)?;
+    if !cli.is_file() {
         return Err("The transcription engine is not installed. Use the Windows installer build, which includes it.".into());
+    }
+    if !model.is_file() {
+        return Err(format!("The \"{}\" model is not downloaded yet. Download it first.", info.id));
     }
     let job_id = uuid::Uuid::new_v4().to_string();
     let work_dir = app.path().app_data_dir().map_err(|e| e.to_string())?.join("transcripts").join(&job_id);
@@ -669,6 +731,8 @@ pub fn run() {
             start_trim_export,
             cancel_job,
             transcribe_status,
+            list_models,
+            start_model_download,
             start_transcribe,
             load_transcript,
             save_transcript,

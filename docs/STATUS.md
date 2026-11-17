@@ -14,6 +14,12 @@
 - Tauri shell commands for transcription/captions compiled only after the Windows CI run; they have not been clicked through yet.
 - Urdu/Hindi accuracy with the `base` model. Expect mistakes; the transcript editor exists to fix them.
 
+## Fixed after first Windows test (17 Nov)
+- Burned-in captions failed: FFmpeg's filter parser split the Windows path at `C:`. Now FFmpeg runs inside the work folder and gets only `captions.ass`.
+- Urdu words came out in pieces: whisper pieces without a leading space are now joined to the previous word.
+- Repeat loops ("word word word...") are cut to at most 3 in a row; whisper is run with `-mc 0` to reduce them.
+- Better models can be downloaded in the app (Small, Large v3 Turbo q5_0) via curl.exe. Not yet tested against the real download or real Urdu audio.
+
 ## Not built yet
 Highlight detection and scoring, multi-clip suggestions, vertical reframing and face tracking, silence removal, Story Studio, characters, voice, provider calls, timeline editor, social presets, assistant.
 

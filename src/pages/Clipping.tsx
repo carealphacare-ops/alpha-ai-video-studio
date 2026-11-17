@@ -3,7 +3,7 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { listen } from "@tauri-apps/api/event";
-import { api, errText, fmtTime, Transcript } from "../api";
+import { api, errText, fmtTime, ModelStatus, Transcript } from "../api";
 
 interface Probe { duration: number; streams: { codec_type: string; codec_name: string; width?: number; height?: number }[] }
 
@@ -25,6 +25,8 @@ export default function Clipping() {
   // Captions
   const [txReady, setTxReady] = useState<{ ready: boolean; detail: string } | null>(null);
   const [language, setLanguage] = useState("auto");
+  const [models, setModels] = useState<ModelStatus[]>([]);
+  const [model, setModel] = useState("base");
   const [txPath, setTxPath] = useState("");
   const [transcript, setTranscript] = useState<Transcript | null>(null);
   const [capStyle, setCapStyle] = useState("bold_yellow");
@@ -74,6 +76,7 @@ export default function Clipping() {
         catch (e) { setErr(errText(e)); }
       } else if (st === "cancelled") setNote("Transcription cancelled.");
     }
+    if (kind === "model") { refreshModels(); setNote(st === "completed" ? "Model downloaded." : st === "cancelled" ? "Download cancelled." : ""); }
     if (kind === "caption") setNote(st === "completed" ? "Clip with captions saved." : st === "cancelled" ? "Cancelled." : "");
   }
 
@@ -83,16 +86,27 @@ export default function Clipping() {
     if (e) { delete early.current[id]; finished(id, e.status, e.error); }
   }
 
+  const refreshModels = () => api.listModels().then(setModels).catch((e) => setErr(errText(e)));
+  useEffect(() => { refreshModels(); }, []);
   useEffect(() => { api.transcribeStatus().then(setTxReady).catch((e) => setErr(errText(e))); }, []);
   useEffect(() => { pathRef.current = path; }, [path]);
 
   async function transcribeNow() {
     setErr(""); setNote(""); setTranscript(null);
     try {
-      const j = await api.startTranscribe(path, language);
+      const j = await api.startTranscribe(path, language, model);
       setTxPath(j.output); txPathRef.current = j.output;
       setBusy({ kind: "transcribe", id: j.id, progress: 0 });
       track(j.id, "transcribe");
+    } catch (e) { setErr(errText(e)); }
+  }
+
+  async function downloadModel() {
+    setErr(""); setNote("");
+    try {
+      const j = await api.startModelDownload(model);
+      setBusy({ kind: "model", id: j.id, progress: 0 });
+      track(j.id, "model");
     } catch (e) { setErr(errText(e)); }
   }
 
@@ -210,13 +224,23 @@ export default function Clipping() {
                 <option value="hi">Hindi</option>
               </select>
             </label>
-            <button className="primary" disabled={!txReady?.ready || !!busy || !info.streams.some((s) => s.codec_type === "audio")} onClick={transcribeNow}>
-              {transcript ? "Transcribe again" : "Transcribe"}
-            </button>
-            {busy?.kind === "transcribe" && <button onClick={() => api.cancelJob(busy.id)}>Cancel</button>}
+            <label>Model{" "}
+              <select value={model} onChange={(e) => setModel(e.target.value)}>
+                {models.map((m) => <option key={m.id} value={m.id}>{m.label}{m.installed ? "" : " [not downloaded]"}</option>)}
+              </select>
+            </label>
+            {models.find((m) => m.id === model && !m.installed) ? (
+              <button className="primary" disabled={!!busy} onClick={downloadModel}>Download model</button>
+            ) : (
+              <button className="primary" disabled={!txReady?.ready || !!busy || !info.streams.some((s) => s.codec_type === "audio")} onClick={transcribeNow}>
+                {transcript ? "Transcribe again" : "Transcribe"}
+              </button>
+            )}
+            {(busy?.kind === "transcribe" || busy?.kind === "model") && <button onClick={() => api.cancelJob(busy.id)}>Cancel</button>}
           </div>
-          {busy?.kind === "transcribe" && <progress value={busy.progress} max={1} style={{ width: "100%", marginTop: 8 }} />}
-          <p className="muted">Runs on your computer, no internet or API key needed. Long videos take a while on CPU. Accuracy for Urdu and Hindi is lower than for English; check the text before exporting.</p>
+          {busy?.kind === "model" && <p className="muted">Downloading the model. The bar shows bytes received compared with the expected size.</p>}
+          {(busy?.kind === "transcribe" || busy?.kind === "model") && <progress value={busy.progress} max={1} style={{ width: "100%", marginTop: 8 }} />}
+          <p className="muted">Runs on your computer, no internet or API key needed. Long videos take a while on CPU. For Urdu or Hindi choose that language yourself (not Detect) and use the Small or Large v3 Turbo model: the bundled Base model makes many mistakes. Always check the text before exporting.</p>
 
           {transcript && (
             <>

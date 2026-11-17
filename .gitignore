@@ -1,0 +1,7 @@
+node_modules
+dist
+target
+src-tauri/resources/ffmpeg/*.exe
+src-tauri/resources/whisper/*.exe
+src-tauri/resources/whisper/*.dll
+src-tauri/resources/whisper/*.bin
